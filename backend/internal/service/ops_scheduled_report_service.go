@@ -3,7 +3,9 @@ package service
 import (
 	"context"
 	"fmt"
+	"html"
 	"log"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -36,11 +38,11 @@ return 0
 `)
 
 type OpsScheduledReportService struct {
-	opsService   *OpsService
-	userService  *UserService
-	emailService *EmailService
-	redisClient  *redis.Client
-	cfg          *config.Config
+	opsService      *OpsService
+	userService     *UserService
+	notifyPublisher OpsNotifyPublisher
+	redisClient     *redis.Client
+	cfg             *config.Config
 
 	instanceID string
 	loc        *time.Location
@@ -58,7 +60,7 @@ type OpsScheduledReportService struct {
 func NewOpsScheduledReportService(
 	opsService *OpsService,
 	userService *UserService,
-	emailService *EmailService,
+	notifyPublisher OpsNotifyPublisher,
 	redisClient *redis.Client,
 	cfg *config.Config,
 ) *OpsScheduledReportService {
@@ -71,11 +73,11 @@ func NewOpsScheduledReportService(
 		}
 	}
 	return &OpsScheduledReportService{
-		opsService:   opsService,
-		userService:  userService,
-		emailService: emailService,
-		redisClient:  redisClient,
-		cfg:          cfg,
+		opsService:      opsService,
+		userService:     userService,
+		notifyPublisher: notifyPublisher,
+		redisClient:     redisClient,
+		cfg:             cfg,
 
 		instanceID:        uuid.NewString(),
 		loc:               loc,
@@ -103,7 +105,7 @@ func (s *OpsScheduledReportService) StartWithContext(ctx context.Context) {
 	if s.cfg != nil && !s.cfg.Ops.Enabled {
 		return
 	}
-	if s.opsService == nil || s.emailService == nil {
+	if s.opsService == nil || s.notifyPublisher == nil {
 		return
 	}
 
@@ -144,7 +146,7 @@ func (s *OpsScheduledReportService) run() {
 }
 
 func (s *OpsScheduledReportService) runOnce() {
-	if s == nil || s.opsService == nil || s.emailService == nil {
+	if s == nil || s.opsService == nil || s.notifyPublisher == nil {
 		return
 	}
 
@@ -207,6 +209,7 @@ type opsScheduledReport struct {
 	ReportType string
 	Schedule   string
 	Enabled    bool
+	PlatformID string
 
 	TimeRange time.Duration
 
@@ -289,6 +292,7 @@ func (s *OpsScheduledReportService) listScheduledReports(ctx context.Context, no
 			ReportType: d.kind,
 			Schedule:   spec,
 			Enabled:    true,
+			PlatformID: strings.TrimSpace(emailCfg.Report.PlatformID),
 
 			TimeRange: d.timeRange,
 
@@ -306,53 +310,85 @@ func (s *OpsScheduledReportService) listScheduledReports(ctx context.Context, no
 }
 
 func (s *OpsScheduledReportService) runReport(ctx context.Context, report *opsScheduledReport, now time.Time) (int, error) {
-	if s == nil || s.opsService == nil || s.emailService == nil || report == nil {
+	if s == nil || s.opsService == nil || s.notifyPublisher == nil || report == nil {
 		return 0, nil
 	}
 	if ctx == nil {
 		ctx = context.Background()
 	}
 
-	// Mark as "run" up-front so a broken SMTP config doesn't spam retries every minute.
+	platformID := strings.TrimSpace(report.PlatformID)
+	if platformID == "" {
+		log.Printf("[OpsScheduledReport] report enabled but platform_id empty, skipping: report=%s", strings.TrimSpace(report.ReportType))
+		return 0, nil
+	}
+
+	// Mark as "run" up-front so failures (Redis/channels) don't spam every minute.
 	s.setLastRunAt(ctx, report.ReportType, now)
 
-	content, err := s.generateReportHTML(ctx, report, now)
+	htmlContent, err := s.generateReportHTML(ctx, report, now)
 	if err != nil {
 		return 0, err
 	}
-	if strings.TrimSpace(content) == "" {
+	if strings.TrimSpace(htmlContent) == "" {
 		// Skip sending when the report decides not to emit content (e.g., digest below min count).
 		return 0, nil
 	}
-
-	recipients := report.Recipients
-	if len(recipients) == 0 && s.userService != nil {
-		admin, err := s.userService.GetFirstAdmin(ctx)
-		if err == nil && admin != nil && strings.TrimSpace(admin.Email) != "" {
-			recipients = []string{strings.TrimSpace(admin.Email)}
-		}
+	subject := fmt.Sprintf("[Ops Report] %s", strings.TrimSpace(report.Name))
+	plain := opsHTMLToText(htmlContent)
+	if strings.TrimSpace(plain) == "" {
+		plain = htmlContent
 	}
-	if len(recipients) == 0 {
+
+	jobType := "ops.report." + strings.TrimSpace(report.ReportType)
+	job := NewOpsNotifyJob(OpsNotifyJobKindReport, jobType)
+	job.PlatformID = platformID
+	job.SubType = strings.TrimSpace(report.ReportType)
+	job.Severity = "info"
+	job.Title = subject
+	job.Content = plain
+	job.DedupKey = fmt.Sprintf("ops_report:%s:%s", strings.TrimSpace(report.ReportType), now.UTC().Format("2006-01-02"))
+	job.Metadata = map[string]any{
+		"report_type":  strings.TrimSpace(report.ReportType),
+		"time_range":   report.TimeRange.String(),
+		"generated_at": now.UTC().Format(time.RFC3339),
+	}
+
+	if err := s.notifyPublisher.Publish(ctx, job); err != nil {
+		log.Printf("[OpsScheduledReport] enqueue notify job failed: report=%s err=%v", strings.TrimSpace(report.ReportType), err)
 		return 0, nil
 	}
-
-	subject := fmt.Sprintf("[Ops Report] %s", strings.TrimSpace(report.Name))
-
-	attempts := 0
-	for _, to := range recipients {
-		addr := strings.TrimSpace(to)
-		if addr == "" {
-			continue
-		}
-		attempts++
-		if err := s.emailService.SendEmail(ctx, addr, subject, content); err != nil {
-			// Ignore per-recipient failures; continue best-effort.
-			continue
-		}
-	}
-	return attempts, nil
+	return 1, nil
 }
 
+func opsHTMLToText(raw string) string {
+	if strings.TrimSpace(raw) == "" {
+		return ""
+	}
+	s := raw
+	replacements := []struct {
+		from string
+		to   string
+	}{
+		{"<br>", "\n"},
+		{"<br/>", "\n"},
+		{"<br />", "\n"},
+		{"</p>", "\n"},
+		{"</li>", "\n"},
+		{"</h1>", "\n"},
+		{"</h2>", "\n"},
+		{"</h3>", "\n"},
+	}
+	for _, r := range replacements {
+		s = strings.ReplaceAll(s, r.from, r.to)
+	}
+	s = regexp.MustCompile(`<[^>]+>`).ReplaceAllString(s, "")
+	s = html.UnescapeString(s)
+	for strings.Contains(s, "\n\n\n") {
+		s = strings.ReplaceAll(s, "\n\n\n", "\n\n")
+	}
+	return strings.TrimSpace(s)
+}
 func (s *OpsScheduledReportService) generateReportHTML(ctx context.Context, report *opsScheduledReport, now time.Time) (string, error) {
 	if s == nil || s.opsService == nil || report == nil {
 		return "", fmt.Errorf("service not initialized")

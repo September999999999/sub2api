@@ -13,38 +13,66 @@ const (
 	opsAlertEvaluatorLeaderLockTTLDefault = 30 * time.Second
 )
 
-// =========================
-// Email notification config
-// =========================
-
-func (s *OpsService) GetEmailNotificationConfig(ctx context.Context) (*OpsEmailNotificationConfig, error) {
-	defaultCfg := defaultOpsEmailNotificationConfig()
-	if s == nil || s.settingRepo == nil {
+func getSettingWithDefault[T any](ctx context.Context, repo SettingRepository, key string, defaultCfg *T, normalize func(cfg, defaultCfg *T)) (*T, error) {
+	if repo == nil {
 		return defaultCfg, nil
 	}
 	if ctx == nil {
 		ctx = context.Background()
 	}
 
-	raw, err := s.settingRepo.GetValue(ctx, SettingKeyOpsEmailNotificationConfig)
+	raw, err := repo.GetValue(ctx, key)
 	if err != nil {
 		if errors.Is(err, ErrSettingNotFound) {
-			// Initialize defaults on first read (best-effort).
 			if b, mErr := json.Marshal(defaultCfg); mErr == nil {
-				_ = s.settingRepo.Set(ctx, SettingKeyOpsEmailNotificationConfig, string(b))
+				_ = repo.Set(ctx, key, string(b))
 			}
 			return defaultCfg, nil
 		}
 		return nil, err
 	}
 
-	cfg := &OpsEmailNotificationConfig{}
+	cfg := new(T)
 	if err := json.Unmarshal([]byte(raw), cfg); err != nil {
-		// Corrupted JSON should not break ops UI; fall back to defaults.
 		return defaultCfg, nil
 	}
-	normalizeOpsEmailNotificationConfig(cfg)
+	if normalize != nil {
+		normalize(cfg, defaultCfg)
+	}
 	return cfg, nil
+}
+
+func setSettingJSON(ctx context.Context, repo SettingRepository, key string, cfg any) ([]byte, error) {
+	if repo == nil {
+		return nil, errors.New("setting repository not initialized")
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	raw, err := json.Marshal(cfg)
+	if err != nil {
+		return nil, err
+	}
+	if err := repo.Set(ctx, key, string(raw)); err != nil {
+		return nil, err
+	}
+	return raw, nil
+}
+
+// =========================
+// Email notification config
+// =========================
+
+func (s *OpsService) GetEmailNotificationConfig(ctx context.Context) (*OpsEmailNotificationConfig, error) {
+	defaultCfg := defaultOpsEmailNotificationConfig()
+	var repo SettingRepository
+	if s != nil {
+		repo = s.settingRepo
+	}
+	return getSettingWithDefault(ctx, repo, SettingKeyOpsEmailNotificationConfig, defaultCfg, func(cfg, _ *OpsEmailNotificationConfig) {
+		normalizeOpsEmailNotificationConfig(cfg)
+	})
 }
 
 func (s *OpsService) UpdateEmailNotificationConfig(ctx context.Context, req *OpsEmailNotificationConfigUpdateRequest) (*OpsEmailNotificationConfig, error) {
@@ -65,6 +93,7 @@ func (s *OpsService) UpdateEmailNotificationConfig(ctx context.Context, req *Ops
 
 	if req.Alert != nil {
 		cfg.Alert.Enabled = req.Alert.Enabled
+		cfg.Alert.PlatformID = strings.TrimSpace(req.Alert.PlatformID)
 		if req.Alert.Recipients != nil {
 			cfg.Alert.Recipients = req.Alert.Recipients
 		}
@@ -76,6 +105,7 @@ func (s *OpsService) UpdateEmailNotificationConfig(ctx context.Context, req *Ops
 
 	if req.Report != nil {
 		cfg.Report.Enabled = req.Report.Enabled
+		cfg.Report.PlatformID = strings.TrimSpace(req.Report.PlatformID)
 		if req.Report.Recipients != nil {
 			cfg.Report.Recipients = req.Report.Recipients
 		}
@@ -96,11 +126,7 @@ func (s *OpsService) UpdateEmailNotificationConfig(ctx context.Context, req *Ops
 	}
 
 	normalizeOpsEmailNotificationConfig(cfg)
-	raw, err := json.Marshal(cfg)
-	if err != nil {
-		return nil, err
-	}
-	if err := s.settingRepo.Set(ctx, SettingKeyOpsEmailNotificationConfig, string(raw)); err != nil {
+	if _, err := setSettingJSON(ctx, s.settingRepo, SettingKeyOpsEmailNotificationConfig, cfg); err != nil {
 		return nil, err
 	}
 	return cfg, nil
@@ -109,7 +135,8 @@ func (s *OpsService) UpdateEmailNotificationConfig(ctx context.Context, req *Ops
 func defaultOpsEmailNotificationConfig() *OpsEmailNotificationConfig {
 	return &OpsEmailNotificationConfig{
 		Alert: OpsEmailAlertConfig{
-			Enabled:               true,
+			Enabled:               false,
+			PlatformID:            "",
 			Recipients:            []string{},
 			MinSeverity:           "",
 			RateLimitPerHour:      0,
@@ -118,6 +145,7 @@ func defaultOpsEmailNotificationConfig() *OpsEmailNotificationConfig {
 		},
 		Report: OpsEmailReportConfig{
 			Enabled:                         false,
+			PlatformID:                      "",
 			Recipients:                      []string{},
 			DailySummaryEnabled:             false,
 			DailySummarySchedule:            "0 9 * * *",
@@ -144,6 +172,8 @@ func normalizeOpsEmailNotificationConfig(cfg *OpsEmailNotificationConfig) {
 		cfg.Report.Recipients = []string{}
 	}
 
+	cfg.Alert.PlatformID = strings.TrimSpace(cfg.Alert.PlatformID)
+	cfg.Report.PlatformID = strings.TrimSpace(cfg.Report.PlatformID)
 	cfg.Alert.MinSeverity = strings.TrimSpace(cfg.Alert.MinSeverity)
 	cfg.Report.DailySummarySchedule = strings.TrimSpace(cfg.Report.DailySummarySchedule)
 	cfg.Report.WeeklySummarySchedule = strings.TrimSpace(cfg.Report.WeeklySummarySchedule)
@@ -168,6 +198,13 @@ func normalizeOpsEmailNotificationConfig(cfg *OpsEmailNotificationConfig) {
 func validateOpsEmailNotificationConfig(cfg *OpsEmailNotificationConfig) error {
 	if cfg == nil {
 		return errors.New("invalid config")
+	}
+
+	if cfg.Alert.Enabled && strings.TrimSpace(cfg.Alert.PlatformID) == "" {
+		return errors.New("alert.platform_id is required when alert.enabled is true")
+	}
+	if cfg.Report.Enabled && strings.TrimSpace(cfg.Report.PlatformID) == "" {
+		return errors.New("report.platform_id is required when report.enabled is true")
 	}
 
 	if cfg.Alert.RateLimitPerHour < 0 {
@@ -277,36 +314,17 @@ func validateOpsAlertSilencingSettings(s OpsAlertSilencingSettings) error {
 
 func (s *OpsService) GetOpsAlertRuntimeSettings(ctx context.Context) (*OpsAlertRuntimeSettings, error) {
 	defaultCfg := defaultOpsAlertRuntimeSettings()
-	if s == nil || s.settingRepo == nil {
-		return defaultCfg, nil
+	var repo SettingRepository
+	if s != nil {
+		repo = s.settingRepo
 	}
-	if ctx == nil {
-		ctx = context.Background()
-	}
-
-	raw, err := s.settingRepo.GetValue(ctx, SettingKeyOpsAlertRuntimeSettings)
-	if err != nil {
-		if errors.Is(err, ErrSettingNotFound) {
-			if b, mErr := json.Marshal(defaultCfg); mErr == nil {
-				_ = s.settingRepo.Set(ctx, SettingKeyOpsAlertRuntimeSettings, string(b))
-			}
-			return defaultCfg, nil
+	return getSettingWithDefault(ctx, repo, SettingKeyOpsAlertRuntimeSettings, defaultCfg, func(cfg, defaultCfg *OpsAlertRuntimeSettings) {
+		if cfg.EvaluationIntervalSeconds <= 0 {
+			cfg.EvaluationIntervalSeconds = defaultCfg.EvaluationIntervalSeconds
 		}
-		return nil, err
-	}
-
-	cfg := &OpsAlertRuntimeSettings{}
-	if err := json.Unmarshal([]byte(raw), cfg); err != nil {
-		return defaultCfg, nil
-	}
-
-	if cfg.EvaluationIntervalSeconds <= 0 {
-		cfg.EvaluationIntervalSeconds = defaultCfg.EvaluationIntervalSeconds
-	}
-	normalizeOpsDistributedLockSettings(&cfg.DistributedLock, opsAlertEvaluatorLeaderLockKeyDefault, defaultCfg.DistributedLock.TTLSeconds)
-	normalizeOpsAlertSilencingSettings(&cfg.Silencing)
-
-	return cfg, nil
+		normalizeOpsDistributedLockSettings(&cfg.DistributedLock, opsAlertEvaluatorLeaderLockKeyDefault, defaultCfg.DistributedLock.TTLSeconds)
+		normalizeOpsAlertSilencingSettings(&cfg.Silencing)
+	})
 }
 
 func (s *OpsService) UpdateOpsAlertRuntimeSettings(ctx context.Context, cfg *OpsAlertRuntimeSettings) (*OpsAlertRuntimeSettings, error) {
@@ -338,11 +356,8 @@ func (s *OpsService) UpdateOpsAlertRuntimeSettings(ctx context.Context, cfg *Ops
 	normalizeOpsDistributedLockSettings(&cfg.DistributedLock, opsAlertEvaluatorLeaderLockKeyDefault, defaultCfg.DistributedLock.TTLSeconds)
 	normalizeOpsAlertSilencingSettings(&cfg.Silencing)
 
-	raw, err := json.Marshal(cfg)
+	raw, err := setSettingJSON(ctx, s.settingRepo, SettingKeyOpsAlertRuntimeSettings, cfg)
 	if err != nil {
-		return nil, err
-	}
-	if err := s.settingRepo.Set(ctx, SettingKeyOpsAlertRuntimeSettings, string(raw)); err != nil {
 		return nil, err
 	}
 
@@ -420,31 +435,13 @@ func validateOpsAdvancedSettings(cfg *OpsAdvancedSettings) error {
 
 func (s *OpsService) GetOpsAdvancedSettings(ctx context.Context) (*OpsAdvancedSettings, error) {
 	defaultCfg := defaultOpsAdvancedSettings()
-	if s == nil || s.settingRepo == nil {
-		return defaultCfg, nil
+	var repo SettingRepository
+	if s != nil {
+		repo = s.settingRepo
 	}
-	if ctx == nil {
-		ctx = context.Background()
-	}
-
-	raw, err := s.settingRepo.GetValue(ctx, SettingKeyOpsAdvancedSettings)
-	if err != nil {
-		if errors.Is(err, ErrSettingNotFound) {
-			if b, mErr := json.Marshal(defaultCfg); mErr == nil {
-				_ = s.settingRepo.Set(ctx, SettingKeyOpsAdvancedSettings, string(b))
-			}
-			return defaultCfg, nil
-		}
-		return nil, err
-	}
-
-	cfg := &OpsAdvancedSettings{}
-	if err := json.Unmarshal([]byte(raw), cfg); err != nil {
-		return defaultCfg, nil
-	}
-
-	normalizeOpsAdvancedSettings(cfg)
-	return cfg, nil
+	return getSettingWithDefault(ctx, repo, SettingKeyOpsAdvancedSettings, defaultCfg, func(cfg, _ *OpsAdvancedSettings) {
+		normalizeOpsAdvancedSettings(cfg)
+	})
 }
 
 func (s *OpsService) UpdateOpsAdvancedSettings(ctx context.Context, cfg *OpsAdvancedSettings) (*OpsAdvancedSettings, error) {
@@ -463,11 +460,8 @@ func (s *OpsService) UpdateOpsAdvancedSettings(ctx context.Context, cfg *OpsAdva
 	}
 
 	normalizeOpsAdvancedSettings(cfg)
-	raw, err := json.Marshal(cfg)
+	raw, err := setSettingJSON(ctx, s.settingRepo, SettingKeyOpsAdvancedSettings, cfg)
 	if err != nil {
-		return nil, err
-	}
-	if err := s.settingRepo.Set(ctx, SettingKeyOpsAdvancedSettings, string(raw)); err != nil {
 		return nil, err
 	}
 
@@ -497,30 +491,11 @@ func defaultOpsMetricThresholds() *OpsMetricThresholds {
 
 func (s *OpsService) GetMetricThresholds(ctx context.Context) (*OpsMetricThresholds, error) {
 	defaultCfg := defaultOpsMetricThresholds()
-	if s == nil || s.settingRepo == nil {
-		return defaultCfg, nil
+	var repo SettingRepository
+	if s != nil {
+		repo = s.settingRepo
 	}
-	if ctx == nil {
-		ctx = context.Background()
-	}
-
-	raw, err := s.settingRepo.GetValue(ctx, SettingKeyOpsMetricThresholds)
-	if err != nil {
-		if errors.Is(err, ErrSettingNotFound) {
-			if b, mErr := json.Marshal(defaultCfg); mErr == nil {
-				_ = s.settingRepo.Set(ctx, SettingKeyOpsMetricThresholds, string(b))
-			}
-			return defaultCfg, nil
-		}
-		return nil, err
-	}
-
-	cfg := &OpsMetricThresholds{}
-	if err := json.Unmarshal([]byte(raw), cfg); err != nil {
-		return defaultCfg, nil
-	}
-
-	return cfg, nil
+	return getSettingWithDefault(ctx, repo, SettingKeyOpsMetricThresholds, defaultCfg, nil)
 }
 
 func (s *OpsService) UpdateMetricThresholds(ctx context.Context, cfg *OpsMetricThresholds) (*OpsMetricThresholds, error) {
@@ -548,11 +523,8 @@ func (s *OpsService) UpdateMetricThresholds(ctx context.Context, cfg *OpsMetricT
 		return nil, errors.New("upstream_error_rate_percent_max must be between 0 and 100")
 	}
 
-	raw, err := json.Marshal(cfg)
+	raw, err := setSettingJSON(ctx, s.settingRepo, SettingKeyOpsMetricThresholds, cfg)
 	if err != nil {
-		return nil, err
-	}
-	if err := s.settingRepo.Set(ctx, SettingKeyOpsMetricThresholds, string(raw)); err != nil {
 		return nil, err
 	}
 

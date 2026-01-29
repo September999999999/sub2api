@@ -6,7 +6,13 @@ import HelpTooltip from '@/components/common/HelpTooltip.vue'
 import BaseDialog from '@/components/common/BaseDialog.vue'
 import Icon from '@/components/icons/Icon.vue'
 import { adminAPI } from '@/api'
-import { opsAPI, type OpsDashboardOverview, type OpsMetricThresholds, type OpsRealtimeTrafficSummary } from '@/api/admin/ops'
+import {
+  opsAPI,
+  type OpsDashboardOverview,
+  type OpsMetricThresholds,
+  type OpsNotifyQueueStatusResponse,
+  type OpsRealtimeTrafficSummary
+} from '@/api/admin/ops'
 import type { OpsRequestDetailsPreset } from './OpsRequestDetailsModal.vue'
 import { useAdminSettingsStore } from '@/stores'
 import { formatNumber } from '@/utils/format'
@@ -280,6 +286,9 @@ const totalTokensLabel = computed(() => formatNumber(overview.value?.token_consu
 const realtimeTrafficSummary = ref<OpsRealtimeTrafficSummary | null>(null)
 const realtimeTrafficLoading = ref(false)
 
+const notifyQueueStatus = ref<OpsNotifyQueueStatusResponse | null>(null)
+const notifyQueueLoading = ref(false)
+
 function makeZeroRealtimeTrafficSummary(): OpsRealtimeTrafficSummary {
   const now = new Date().toISOString()
   return {
@@ -314,6 +323,24 @@ async function loadRealtimeTrafficSummary() {
   }
 }
 
+async function loadNotifyQueueStatus() {
+  if (notifyQueueLoading.value) return
+  if (!adminSettingsStore.opsMonitoringEnabled) {
+    notifyQueueStatus.value = null
+    return
+  }
+
+  notifyQueueLoading.value = true
+  try {
+    notifyQueueStatus.value = await opsAPI.getNotifyQueueStatus()
+  } catch (err) {
+    console.error('[OpsDashboardHeader] Failed to load notify queue status', err)
+    notifyQueueStatus.value = null
+  } finally {
+    notifyQueueLoading.value = false
+  }
+}
+
 watch(
   () => [realtimeWindow.value, props.platform, props.groupId] as const,
   () => {
@@ -328,14 +355,14 @@ watch(
     if (!enabled) {
       // Keep UI stable when realtime monitoring is turned off.
       realtimeTrafficSummary.value = makeZeroRealtimeTrafficSummary()
-    } else {
-      loadRealtimeTrafficSummary()
+      return
     }
+    loadRealtimeTrafficSummary()
   },
   { immediate: true }
 )
 
-// Realtime traffic refresh follows the parent (OpsDashboard) refresh cadence.
+// Refresh follows the parent (OpsDashboard) cadence.
 watch(
   () => [props.autoRefreshEnabled, props.autoRefreshCountdown, props.loading] as const,
   ([enabled, countdown, loading]) => {
@@ -344,11 +371,22 @@ watch(
     // Treat countdown reset (or reaching 0) as a refresh boundary.
     if (countdown === 0) {
       loadRealtimeTrafficSummary()
+      loadNotifyQueueStatus()
     }
   }
 )
 
-// no-op: parent controls refresh cadence
+watch(
+  () => adminSettingsStore.opsMonitoringEnabled,
+  (enabled) => {
+    if (enabled) {
+      loadNotifyQueueStatus()
+    } else {
+      notifyQueueStatus.value = null
+    }
+  },
+  { immediate: true }
+)
 
 const displayRealTimeQps = computed(() => {
   const v = realtimeTrafficSummary.value?.qps?.current
@@ -540,6 +578,93 @@ const diagnosisReport = computed<DiagnosisItem[]>(() => {
         action: t('admin.ops.diagnosis.memoryHighAction')
       })
     }
+  }
+
+  if (notifyQueueStatus.value?.enabled !== false) {
+    const status = notifyQueueStatus.value
+    const redisDown = ov.system_metrics?.redis_ok === false
+
+    const streamError = status?.stream?.error
+    const dlqError = status?.dlq?.error
+    if (!redisDown && (streamError || dlqError)) {
+      report.push({
+        type: 'warning',
+        message: t('admin.ops.diagnosis.notifyQueueStatusUnavailable'),
+        impact: t('admin.ops.diagnosis.notifyQueueStatusUnavailableImpact'),
+        action: t('admin.ops.diagnosis.notifyQueueStatusUnavailableAction')
+      })
+    }
+
+    const dlqLen = status?.dlq?.length ?? 0
+    if (dlqLen > 0) {
+      report.push({
+        type: 'critical',
+        message: t('admin.ops.diagnosis.notifyQueueDlqCritical', { count: dlqLen }),
+        impact: t('admin.ops.diagnosis.notifyQueueDlqCriticalImpact'),
+        action: t('admin.ops.diagnosis.notifyQueueDlqCriticalAction')
+      })
+    }
+
+    const groups = status?.stream?.groups ?? []
+    const streamLen = status?.stream?.length ?? 0
+    const consumersTotal = groups.reduce((sum, g) => sum + (g.consumers || 0), 0)
+    if (streamLen > 0 && consumersTotal === 0) {
+      report.push({
+        type: 'critical',
+        message: t('admin.ops.diagnosis.notifyQueueNoConsumers'),
+        impact: t('admin.ops.diagnosis.notifyQueueNoConsumersImpact'),
+        action: t('admin.ops.diagnosis.notifyQueueNoConsumersAction')
+      })
+    }
+
+    const pendingTotal = groups.reduce((sum, g) => sum + (g.pending || 0), 0)
+    const maxLag = groups.reduce((m, g) => {
+      const v = typeof g.lag === 'number' ? g.lag : -1
+      return v > m ? v : m
+    }, -1)
+
+    if (pendingTotal >= 100) {
+      report.push({
+        type: 'warning',
+        message: t('admin.ops.diagnosis.notifyQueuePendingHigh', { count: pendingTotal }),
+        impact: t('admin.ops.diagnosis.notifyQueuePendingHighImpact'),
+        action: t('admin.ops.diagnosis.notifyQueuePendingHighAction')
+      })
+    }
+
+    if (maxLag >= 500) {
+      report.push({
+        type: 'critical',
+        message: t('admin.ops.diagnosis.notifyQueueLagHigh', { lag: maxLag }),
+        impact: t('admin.ops.diagnosis.notifyQueueLagHighImpact'),
+        action: t('admin.ops.diagnosis.notifyQueueLagHighAction')
+      })
+    } else if (maxLag >= 100) {
+      report.push({
+        type: 'warning',
+        message: t('admin.ops.diagnosis.notifyQueueLagHigh', { lag: maxLag }),
+        impact: t('admin.ops.diagnosis.notifyQueueLagHighImpact'),
+        action: t('admin.ops.diagnosis.notifyQueueLagHighAction')
+      })
+    }
+  }
+
+  // Latency diagnostics
+  const durationP99 = ov.duration?.p99_ms ?? 0
+  if (durationP99 > 2000) {
+    report.push({
+      type: 'critical',
+      message: t('admin.ops.diagnosis.latencyCritical', { latency: durationP99.toFixed(0) }),
+      impact: t('admin.ops.diagnosis.latencyCriticalImpact'),
+      action: t('admin.ops.diagnosis.latencyCriticalAction')
+    })
+  } else if (durationP99 > 1000) {
+    report.push({
+      type: 'warning',
+      message: t('admin.ops.diagnosis.latencyHigh', { latency: durationP99.toFixed(0) }),
+      impact: t('admin.ops.diagnosis.latencyHighImpact'),
+      action: t('admin.ops.diagnosis.latencyHighAction')
+    })
   }
 
   const ttftP99 = ov.ttft?.p99_ms ?? 0

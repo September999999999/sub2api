@@ -53,6 +53,9 @@ func RegisterAdminRoutes(
 		// 运维监控（Ops）
 		registerOpsRoutes(admin, h)
 
+		// 通知配置（Webhook）
+		RegisterNotificationRoutes(admin, h.Admin.Notification)
+
 		// 系统管理
 		registerSystemRoutes(admin, h)
 
@@ -74,6 +77,7 @@ func registerOpsRoutes(admin *gin.RouterGroup, h *handler.Handlers) {
 		ops.GET("/concurrency", h.Admin.Ops.GetConcurrencyStats)
 		ops.GET("/account-availability", h.Admin.Ops.GetAccountAvailability)
 		ops.GET("/realtime-traffic", h.Admin.Ops.GetRealtimeTrafficSummary)
+		ops.GET("/notify-queue", h.Admin.Ops.GetNotifyQueueStatus)
 
 		// Alerts (rules + events)
 		ops.GET("/alert-rules", h.Admin.Ops.ListAlertRules)

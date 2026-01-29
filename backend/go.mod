@@ -1,6 +1,8 @@
 module github.com/Wei-Shaw/sub2api
 
-go 1.25.5
+go 1.24.0
+
+replace github.com/nikoksr/notify => ./internal/third_party/notify
 
 require (
 	entgo.io/ent v0.14.5
@@ -11,6 +13,7 @@ require (
 	github.com/gorilla/websocket v1.5.3
 	github.com/imroc/req/v3 v3.57.0
 	github.com/lib/pq v1.10.9
+	github.com/nikoksr/notify v0.41.0
 	github.com/redis/go-redis/v9 v9.17.2
 	github.com/shirou/gopsutil/v4 v4.25.6
 	github.com/spf13/viper v1.18.2

@@ -3,6 +3,7 @@ import { ref, computed, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { useAppStore } from '@/stores/app'
 import { opsAPI } from '@/api/admin/ops'
+import { getPlatforms, type PlatformConfig } from '@/api/notification'
 import BaseDialog from '@/components/common/BaseDialog.vue'
 import Select from '@/components/common/Select.vue'
 import Toggle from '@/components/common/Toggle.vue'
@@ -27,6 +28,7 @@ const saving = ref(false)
 const runtimeSettings = ref<OpsAlertRuntimeSettings | null>(null)
 // 邮件通知配置
 const emailConfig = ref<EmailNotificationConfig | null>(null)
+const platforms = ref<PlatformConfig[]>([])
 // 高级设置
 const advancedSettings = ref<OpsAdvancedSettings | null>(null)
 // 指标阈值配置
@@ -41,15 +43,21 @@ const metricThresholds = ref<OpsMetricThresholds>({
 async function loadAllSettings() {
   loading.value = true
   try {
-    const [runtime, email, advanced, thresholds] = await Promise.all([
+    const [runtime, email, advanced, thresholds, platformsResp] = await Promise.all([
       opsAPI.getAlertRuntimeSettings(),
       opsAPI.getEmailNotificationConfig(),
       opsAPI.getAdvancedSettings(),
-      opsAPI.getMetricThresholds()
+      opsAPI.getMetricThresholds(),
+      getPlatforms()
     ])
     runtimeSettings.value = runtime
     emailConfig.value = email
+    if (emailConfig.value) {
+      emailConfig.value.alert.platform_id = emailConfig.value.alert.platform_id ?? ''
+      emailConfig.value.report.platform_id = emailConfig.value.report.platform_id ?? ''
+    }
     advancedSettings.value = advanced
+    platforms.value = platformsResp.items || []
     // 如果后端返回了阈值，使用后端的值；否则保持默认值
     if (thresholds && Object.keys(thresholds).length > 0) {
         metricThresholds.value = {
@@ -74,9 +82,27 @@ watch(() => props.show, (show) => {
   }
 })
 
-// 邮件输入
-const alertRecipientInput = ref('')
-const reportRecipientInput = ref('')
+watch(
+  () => emailConfig.value?.alert.enabled,
+  (enabled) => {
+    if (!emailConfig.value) return
+    if (enabled && platformOptions.value.length === 0) {
+      emailConfig.value.alert.enabled = false
+      appStore.showError(t('admin.ops.email.validation.noPlatformsAvailable'))
+    }
+  }
+)
+
+watch(
+  () => emailConfig.value?.report.enabled,
+  (enabled) => {
+    if (!emailConfig.value) return
+    if (enabled && platformOptions.value.length === 0) {
+      emailConfig.value.report.enabled = false
+      appStore.showError(t('admin.ops.email.validation.noPlatformsAvailable'))
+    }
+  }
+)
 
 // 严重级别选项
 const severityOptions: Array<{ value: AlertSeverity | ''; label: string }> = [
@@ -86,38 +112,10 @@ const severityOptions: Array<{ value: AlertSeverity | ''; label: string }> = [
   { value: 'info', label: t('common.info') }
 ]
 
-// 验证邮箱
-function isValidEmailAddress(email: string): boolean {
-  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)
-}
-
-// 添加收件人
-function addRecipient(target: 'alert' | 'report') {
-  if (!emailConfig.value) return
-  const raw = (target === 'alert' ? alertRecipientInput.value : reportRecipientInput.value).trim()
-  if (!raw) return
-
-  if (!isValidEmailAddress(raw)) {
-    appStore.showError(t('common.invalidEmail'))
-    return
-  }
-
-  const normalized = raw.toLowerCase()
-  const list = target === 'alert' ? emailConfig.value.alert.recipients : emailConfig.value.report.recipients
-  if (!list.includes(normalized)) {
-    list.push(normalized)
-  }
-  if (target === 'alert') alertRecipientInput.value = ''
-  else reportRecipientInput.value = ''
-}
-
-// 移除收件人
-function removeRecipient(target: 'alert' | 'report', email: string) {
-  if (!emailConfig.value) return
-  const list = target === 'alert' ? emailConfig.value.alert.recipients : emailConfig.value.report.recipients
-  const idx = list.indexOf(email)
-  if (idx >= 0) list.splice(idx, 1)
-}
+const platformOptions = computed(() => {
+  const enabled = platforms.value.filter((p) => p.enabled)
+  return enabled.map((p) => ({ value: p.id, label: `${p.name} (${p.type})` }))
+})
 
 // 验证
 const validation = computed(() => {
@@ -133,11 +131,14 @@ const validation = computed(() => {
 
   // 验证邮件配置
   if (emailConfig.value) {
-    if (emailConfig.value.alert.enabled && emailConfig.value.alert.recipients.length === 0) {
-      errors.push(t('admin.ops.email.validation.alertRecipientsRequired'))
+    if (emailConfig.value.alert.enabled && !(emailConfig.value.alert.platform_id ?? '').trim()) {
+      errors.push(t('admin.ops.email.validation.alertPlatformRequired'))
     }
-    if (emailConfig.value.report.enabled && emailConfig.value.report.recipients.length === 0) {
-      errors.push(t('admin.ops.email.validation.reportRecipientsRequired'))
+    if (emailConfig.value.report.enabled && !(emailConfig.value.report.platform_id ?? '').trim()) {
+      errors.push(t('admin.ops.email.validation.reportPlatformRequired'))
+    }
+    if ((emailConfig.value.alert.enabled || emailConfig.value.report.enabled) && platformOptions.value.length === 0) {
+      errors.push(t('admin.ops.email.validation.noPlatformsAvailable'))
     }
   }
 
@@ -243,32 +244,14 @@ async function saveAllSettings() {
           </div>
 
           <div v-if="emailConfig.alert.enabled">
-            <label class="input-label">{{ t('admin.ops.settings.alertRecipients') }}</label>
-            <div class="flex gap-2">
-              <input
-                v-model="alertRecipientInput"
-                type="email"
-                class="input"
-                :placeholder="t('admin.ops.settings.emailPlaceholder')"
-                @keydown.enter.prevent="addRecipient('alert')"
-              />
-              <button class="btn btn-secondary whitespace-nowrap" type="button" @click="addRecipient('alert')">
-                {{ t('common.add') }}
-              </button>
+            <div>
+              <label class="input-label">{{ t('admin.ops.email.platform') }}</label>
+              <Select v-model="emailConfig.alert.platform_id" :options="platformOptions" />
+              <p v-if="platformOptions.length === 0" class="mt-1 text-xs text-amber-700 dark:text-amber-300">
+                {{ t('admin.ops.email.validation.noPlatformsAvailable') }}
+              </p>
             </div>
-            <div class="mt-2 flex flex-wrap gap-2">
-              <span
-                v-for="email in emailConfig.alert.recipients"
-                :key="email"
-                class="inline-flex items-center gap-2 rounded-full bg-blue-100 px-3 py-1 text-xs font-medium text-blue-700 dark:bg-blue-900/30 dark:text-blue-400"
-              >
-                {{ email }}
-                <button type="button" class="text-blue-700/80 hover:text-blue-900" @click="removeRecipient('alert', email)">×</button>
-              </span>
-            </div>
-            <p class="mt-2 text-xs text-gray-500 dark:text-gray-400">
-              {{ t('admin.ops.settings.recipientsHint') }}
-            </p>
+
           </div>
 
           <div v-if="emailConfig.alert.enabled">
@@ -291,32 +274,14 @@ async function saveAllSettings() {
           </div>
 
           <div v-if="emailConfig.report.enabled">
-            <label class="input-label">{{ t('admin.ops.settings.reportRecipients') }}</label>
-            <div class="flex gap-2">
-              <input
-                v-model="reportRecipientInput"
-                type="email"
-                class="input"
-                :placeholder="t('admin.ops.settings.emailPlaceholder')"
-                @keydown.enter.prevent="addRecipient('report')"
-              />
-              <button class="btn btn-secondary whitespace-nowrap" type="button" @click="addRecipient('report')">
-                {{ t('common.add') }}
-              </button>
+            <div>
+              <label class="input-label">{{ t('admin.ops.email.platform') }}</label>
+              <Select v-model="emailConfig.report.platform_id" :options="platformOptions" />
+              <p v-if="platformOptions.length === 0" class="mt-1 text-xs text-amber-700 dark:text-amber-300">
+                {{ t('admin.ops.email.validation.noPlatformsAvailable') }}
+              </p>
             </div>
-            <div class="mt-2 flex flex-wrap gap-2">
-              <span
-                v-for="email in emailConfig.report.recipients"
-                :key="email"
-                class="inline-flex items-center gap-2 rounded-full bg-blue-100 px-3 py-1 text-xs font-medium text-blue-700 dark:bg-blue-900/30 dark:text-blue-400"
-              >
-                {{ email }}
-                <button type="button" class="text-blue-700/80 hover:text-blue-900" @click="removeRecipient('report', email)">×</button>
-              </span>
-            </div>
-            <p class="mt-2 text-xs text-gray-500 dark:text-gray-400">
-              {{ t('admin.ops.settings.recipientsHint') }}
-            </p>
+
           </div>
 
           <div v-if="emailConfig.report.enabled" class="grid grid-cols-1 gap-4 md:grid-cols-2">

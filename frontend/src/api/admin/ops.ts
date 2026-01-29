@@ -132,6 +132,42 @@ export interface OpsPercentiles {
   max_ms?: number | null
 }
 
+export interface OpsNotifyQueueGroupStatus {
+  name: string
+  consumers: number
+  pending: number
+  lag?: number | null
+  last_delivered_id?: string
+}
+
+export interface OpsNotifyQueueStreamStatus {
+  key: string
+  length: number
+  groups: OpsNotifyQueueGroupStatus[]
+  error?: string
+}
+
+export interface OpsNotifyQueueDLQEntry {
+  id: string
+  at: string
+  source_id: string
+  error: string
+  attempts: number
+}
+
+export interface OpsNotifyQueueDLQStatus {
+  key: string
+  length: number
+  recent: OpsNotifyQueueDLQEntry[]
+  error?: string
+}
+
+export interface OpsNotifyQueueStatusResponse {
+  enabled: boolean
+  stream: OpsNotifyQueueStreamStatus
+  dlq: OpsNotifyQueueDLQStatus
+}
+
 export interface OpsThroughputTrendPoint {
   bucket_start: string
   request_count: number
@@ -335,15 +371,20 @@ export interface OpsConcurrencyStatsResponse {
   timestamp?: string
 }
 
-export async function getConcurrencyStats(platform?: string, groupId?: number | null): Promise<OpsConcurrencyStatsResponse> {
-  const params: Record<string, any> = {}
-  if (platform) {
-    params.platform = platform
-  }
-  if (typeof groupId === 'number' && groupId > 0) {
-    params.group_id = groupId
-  }
+type OpsScopeParams = {
+  platform?: string
+  group_id?: number
+}
 
+function buildOpsScopeParams(platform?: string, groupId?: number | null): OpsScopeParams {
+  const params: OpsScopeParams = {}
+  if (platform) params.platform = platform
+  if (typeof groupId === 'number' && groupId > 0) params.group_id = groupId
+  return params
+}
+
+export async function getConcurrencyStats(platform?: string, groupId?: number | null): Promise<OpsConcurrencyStatsResponse> {
+  const params = buildOpsScopeParams(platform, groupId)
   const { data } = await apiClient.get<OpsConcurrencyStatsResponse>('/admin/ops/concurrency', { params })
   return data
 }
@@ -393,13 +434,7 @@ export interface OpsAccountAvailabilityStatsResponse {
 }
 
 export async function getAccountAvailabilityStats(platform?: string, groupId?: number | null): Promise<OpsAccountAvailabilityStatsResponse> {
-  const params: Record<string, any> = {}
-  if (platform) {
-    params.platform = platform
-  }
-  if (typeof groupId === 'number' && groupId > 0) {
-    params.group_id = groupId
-  }
+  const params = buildOpsScopeParams(platform, groupId)
   const { data } = await apiClient.get<OpsAccountAvailabilityStatsResponse>('/admin/ops/account-availability', { params })
   return data
 }
@@ -431,14 +466,7 @@ export async function getRealtimeTrafficSummary(
   platform?: string,
   groupId?: number | null
 ): Promise<OpsRealtimeTrafficSummaryResponse> {
-  const params: Record<string, any> = { window }
-  if (platform) {
-    params.platform = platform
-  }
-  if (typeof groupId === 'number' && groupId > 0) {
-    params.group_id = groupId
-  }
-
+  const params = { window, ...buildOpsScopeParams(platform, groupId) }
   const { data } = await apiClient.get<OpsRealtimeTrafficSummaryResponse>('/admin/ops/realtime-traffic', { params })
   return data
 }
@@ -718,6 +746,7 @@ export interface AlertEvent {
 export interface EmailNotificationConfig {
   alert: {
     enabled: boolean
+    platform_id: string
     recipients: string[]
     min_severity: AlertSeverity | ''
     rate_limit_per_hour: number
@@ -726,6 +755,7 @@ export interface EmailNotificationConfig {
   }
   report: {
     enabled: boolean
+    platform_id: string
     recipients: string[]
     daily_summary_enabled: boolean
     daily_summary_schedule: string
@@ -1147,6 +1177,11 @@ export async function updateAdvancedSettings(config: OpsAdvancedSettings): Promi
   return data
 }
 
+export async function getNotifyQueueStatus(): Promise<OpsNotifyQueueStatusResponse> {
+  const { data } = await apiClient.get<OpsNotifyQueueStatusResponse>('/admin/ops/notify-queue')
+  return data
+}
+
 // ==================== Metric Thresholds ====================
 
 async function getMetricThresholds(): Promise<OpsMetricThresholds> {
@@ -1203,6 +1238,7 @@ export const opsAPI = {
   updateAlertRuntimeSettings,
   getAdvancedSettings,
   updateAdvancedSettings,
+  getNotifyQueueStatus,
   getMetricThresholds,
   updateMetricThresholds
 }

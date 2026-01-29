@@ -8,7 +8,9 @@ type OpsEmailNotificationConfig struct {
 }
 
 type OpsEmailAlertConfig struct {
-	Enabled               bool     `json:"enabled"`
+	Enabled    bool   `json:"enabled"`
+	PlatformID string `json:"platform_id,omitempty"`
+
 	Recipients            []string `json:"recipients"`
 	MinSeverity           string   `json:"min_severity"`
 	RateLimitPerHour      int      `json:"rate_limit_per_hour"`
@@ -17,7 +19,9 @@ type OpsEmailAlertConfig struct {
 }
 
 type OpsEmailReportConfig struct {
-	Enabled                         bool     `json:"enabled"`
+	Enabled    bool   `json:"enabled"`
+	PlatformID string `json:"platform_id,omitempty"`
+
 	Recipients                      []string `json:"recipients"`
 	DailySummaryEnabled             bool     `json:"daily_summary_enabled"`
 	DailySummarySchedule            string   `json:"daily_summary_schedule"`

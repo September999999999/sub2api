@@ -3,6 +3,7 @@ import { ref, onMounted, computed } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { useAppStore } from '@/stores/app'
 import { opsAPI } from '@/api/admin/ops'
+import { getPlatforms, type PlatformConfig } from '@/api/notification'
 import type { EmailNotificationConfig, AlertSeverity } from '../types'
 import BaseDialog from '@/components/common/BaseDialog.vue'
 import Select from '@/components/common/Select.vue'
@@ -12,14 +13,11 @@ const appStore = useAppStore()
 
 const loading = ref(false)
 const config = ref<EmailNotificationConfig | null>(null)
+const platforms = ref<PlatformConfig[]>([])
 
 const showEditor = ref(false)
 const saving = ref(false)
 const draft = ref<EmailNotificationConfig | null>(null)
-const alertRecipientInput = ref('')
-const reportRecipientInput = ref('')
-const alertRecipientError = ref('')
-const reportRecipientError = ref('')
 
 const severityOptions: Array<{ value: AlertSeverity | ''; label: string }> = [
   { value: '', label: t('admin.ops.email.minSeverityAll') },
@@ -28,16 +26,42 @@ const severityOptions: Array<{ value: AlertSeverity | ''; label: string }> = [
   { value: 'info', label: t('common.info') }
 ]
 
+const platformOptions = computed(() => {
+  const enabled = platforms.value.filter((p) => p.enabled)
+  return enabled.map((p) => ({ value: p.id, label: `${p.name} (${p.type})` }))
+})
+
+function platformLabel(platformID: string): string {
+  const id = (platformID || '').trim()
+  if (!id) return t('common.selectOption')
+  const p = platforms.value.find((x) => x.id === id)
+  if (!p) return id
+  const suffix = p.enabled ? '' : ` (${t('common.disabled')})`
+  return `${p.name} (${p.type})${suffix}`
+}
+
 async function loadConfig() {
   loading.value = true
   try {
     const data = await opsAPI.getEmailNotificationConfig()
+    data.alert.platform_id = data.alert.platform_id ?? ''
+    data.report.platform_id = data.report.platform_id ?? ''
     config.value = data
   } catch (err: any) {
     console.error('[OpsEmailNotificationCard] Failed to load config', err)
     appStore.showError(err?.response?.data?.detail || t('admin.ops.email.loadFailed'))
   } finally {
     loading.value = false
+  }
+}
+
+async function loadPlatforms() {
+  try {
+    const data = await getPlatforms()
+    platforms.value = data.items || []
+  } catch (err: any) {
+    console.error('[OpsEmailNotificationCard] Failed to load platforms', err)
+    appStore.showError(err?.response?.data?.detail || t('admin.ops.email.platformLoadFailed'))
   }
 }
 
@@ -63,15 +87,11 @@ async function saveConfig() {
 function openEditor() {
   if (!config.value) return
   draft.value = JSON.parse(JSON.stringify(config.value))
-  alertRecipientInput.value = ''
-  reportRecipientInput.value = ''
-  alertRecipientError.value = ''
-  reportRecipientError.value = ''
+  if (draft.value) {
+    draft.value.alert.platform_id = draft.value.alert.platform_id ?? ''
+    draft.value.report.platform_id = draft.value.report.platform_id ?? ''
+  }
   showEditor.value = true
-}
-
-function isValidEmailAddress(email: string): boolean {
-  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)
 }
 
 function isNonNegativeNumber(value: unknown): boolean {
@@ -89,18 +109,15 @@ const editorValidation = computed(() => {
   const errors: string[] = []
   if (!draft.value) return { valid: true, errors }
 
-  if (draft.value.alert.enabled && draft.value.alert.recipients.length === 0) {
-    errors.push(t('admin.ops.email.validation.alertRecipientsRequired'))
+  if (draft.value.alert.enabled && !(draft.value.alert.platform_id ?? '').trim()) {
+    errors.push(t('admin.ops.email.validation.alertPlatformRequired'))
   }
-  if (draft.value.report.enabled && draft.value.report.recipients.length === 0) {
-    errors.push(t('admin.ops.email.validation.reportRecipientsRequired'))
+  if (draft.value.report.enabled && !(draft.value.report.platform_id ?? '').trim()) {
+    errors.push(t('admin.ops.email.validation.reportPlatformRequired'))
   }
-
-  const invalidAlertRecipients = draft.value.alert.recipients.filter((e) => !isValidEmailAddress(e))
-  if (invalidAlertRecipients.length > 0) errors.push(t('admin.ops.email.validation.invalidRecipients'))
-
-  const invalidReportRecipients = draft.value.report.recipients.filter((e) => !isValidEmailAddress(e))
-  if (invalidReportRecipients.length > 0) errors.push(t('admin.ops.email.validation.invalidRecipients'))
+  if ((draft.value.alert.enabled || draft.value.report.enabled) && platformOptions.value.length === 0) {
+    errors.push(t('admin.ops.email.validation.noPlatformsAvailable'))
+  }
 
   if (!isNonNegativeNumber(draft.value.alert.rate_limit_per_hour)) {
     errors.push(t('admin.ops.email.validation.rateLimitRange'))
@@ -145,37 +162,9 @@ const editorValidation = computed(() => {
   return { valid: errors.length === 0, errors }
 })
 
-function addRecipient(target: 'alert' | 'report') {
-  if (!draft.value) return
-  const raw = (target === 'alert' ? alertRecipientInput.value : reportRecipientInput.value).trim()
-  if (!raw) return
-
-  if (!isValidEmailAddress(raw)) {
-    const msg = t('common.invalidEmail')
-    if (target === 'alert') alertRecipientError.value = msg
-    else reportRecipientError.value = msg
-    return
-  }
-
-  const normalized = raw.toLowerCase()
-  const list = target === 'alert' ? draft.value.alert.recipients : draft.value.report.recipients
-  if (!list.includes(normalized)) {
-    list.push(normalized)
-  }
-  if (target === 'alert') alertRecipientInput.value = ''
-  else reportRecipientInput.value = ''
-  if (target === 'alert') alertRecipientError.value = ''
-  else reportRecipientError.value = ''
-}
-
-function removeRecipient(target: 'alert' | 'report', email: string) {
-  if (!draft.value) return
-  const list = target === 'alert' ? draft.value.alert.recipients : draft.value.report.recipients
-  const idx = list.indexOf(email)
-  if (idx >= 0) list.splice(idx, 1)
-}
 
 onMounted(() => {
+  loadPlatforms()
   loadConfig()
 })
 </script>
@@ -218,8 +207,8 @@ onMounted(() => {
             </span>
           </div>
           <div class="text-xs text-gray-600 dark:text-gray-300">
-            {{ t('admin.ops.email.recipients') }}:
-            <span class="ml-1 font-medium text-gray-900 dark:text-white">{{ config.alert.recipients.length }}</span>
+            {{ t('admin.ops.email.platform') }}:
+            <span class="ml-1 font-medium text-gray-900 dark:text-white">{{ platformLabel(config.alert.platform_id) }}</span>
           </div>
           <div class="text-xs text-gray-600 dark:text-gray-300">
             {{ t('admin.ops.email.minSeverity') }}:
@@ -244,8 +233,8 @@ onMounted(() => {
             </span>
           </div>
           <div class="text-xs text-gray-600 dark:text-gray-300">
-            {{ t('admin.ops.email.recipients') }}:
-            <span class="ml-1 font-medium text-gray-900 dark:text-white">{{ config.report.recipients.length }}</span>
+            {{ t('admin.ops.email.platform') }}:
+            <span class="ml-1 font-medium text-gray-900 dark:text-white">{{ platformLabel(config.report.platform_id) }}</span>
           </div>
         </div>
       </div>
@@ -269,9 +258,25 @@ onMounted(() => {
           <div>
             <div class="mb-1 text-xs font-medium text-gray-600 dark:text-gray-300">{{ t('common.enabled') }}</div>
             <label class="inline-flex items-center gap-2 text-sm text-gray-700 dark:text-gray-300">
-              <input v-model="draft.alert.enabled" type="checkbox" class="h-4 w-4 rounded border-gray-300" />
+              <input
+                v-model="draft.alert.enabled"
+                type="checkbox"
+                class="h-4 w-4 rounded border-gray-300"
+                :disabled="!draft.alert.enabled && platformOptions.length === 0"
+              />
               <span>{{ draft.alert.enabled ? t('common.enabled') : t('common.disabled') }}</span>
             </label>
+          </div>
+
+          <div>
+            <div class="mb-1 text-xs font-medium text-gray-600 dark:text-gray-300">{{ t('admin.ops.email.platform') }}</div>
+            <Select v-model="draft.alert.platform_id" :options="platformOptions" />
+            <p
+              v-if="draft.alert.enabled && platformOptions.length === 0"
+              class="mt-1 text-xs text-amber-700 dark:text-amber-300"
+            >
+              {{ t('admin.ops.email.validation.noPlatformsAvailable') }}
+            </p>
           </div>
 
           <div>
@@ -279,39 +284,6 @@ onMounted(() => {
             <Select v-model="draft.alert.min_severity" :options="severityOptions" />
           </div>
 
-          <div class="md:col-span-2">
-            <div class="mb-1 text-xs font-medium text-gray-600 dark:text-gray-300">{{ t('admin.ops.email.recipients') }}</div>
-            <div class="flex gap-2">
-              <input
-                v-model="alertRecipientInput"
-                type="email"
-                class="input"
-                :placeholder="t('admin.ops.email.recipients')"
-                @keydown.enter.prevent="addRecipient('alert')"
-              />
-              <button class="btn btn-secondary whitespace-nowrap" type="button" @click="addRecipient('alert')">
-                {{ t('common.add') }}
-              </button>
-            </div>
-            <p v-if="alertRecipientError" class="mt-1 text-xs text-red-600 dark:text-red-400">{{ alertRecipientError }}</p>
-            <div class="mt-2 flex flex-wrap gap-2">
-              <span
-                v-for="email in draft.alert.recipients"
-                :key="email"
-                class="inline-flex items-center gap-2 rounded-full bg-blue-100 px-3 py-1 text-xs font-medium text-blue-700 dark:bg-blue-900/30 dark:text-blue-400"
-              >
-                {{ email }}
-                <button
-                  type="button"
-                  class="text-blue-700/80 hover:text-blue-900 dark:text-blue-300"
-                  @click="removeRecipient('alert', email)"
-                >
-                  ×
-                </button>
-              </span>
-            </div>
-            <div class="mt-1 text-xs text-gray-500 dark:text-gray-400">{{ t('admin.ops.email.recipientsHint') }}</div>
-          </div>
 
           <div>
             <div class="mb-1 text-xs font-medium text-gray-600 dark:text-gray-300">{{ t('admin.ops.email.rateLimitPerHour') }}</div>
@@ -339,43 +311,27 @@ onMounted(() => {
           <div>
             <div class="mb-1 text-xs font-medium text-gray-600 dark:text-gray-300">{{ t('common.enabled') }}</div>
             <label class="inline-flex items-center gap-2 text-sm text-gray-700 dark:text-gray-300">
-              <input v-model="draft.report.enabled" type="checkbox" class="h-4 w-4 rounded border-gray-300" />
+              <input
+                v-model="draft.report.enabled"
+                type="checkbox"
+                class="h-4 w-4 rounded border-gray-300"
+                :disabled="!draft.report.enabled && platformOptions.length === 0"
+              />
               <span>{{ draft.report.enabled ? t('common.enabled') : t('common.disabled') }}</span>
             </label>
           </div>
 
-          <div class="md:col-span-2">
-            <div class="mb-1 text-xs font-medium text-gray-600 dark:text-gray-300">{{ t('admin.ops.email.recipients') }}</div>
-            <div class="flex gap-2">
-              <input
-                v-model="reportRecipientInput"
-                type="email"
-                class="input"
-                :placeholder="t('admin.ops.email.recipients')"
-                @keydown.enter.prevent="addRecipient('report')"
-              />
-              <button class="btn btn-secondary whitespace-nowrap" type="button" @click="addRecipient('report')">
-                {{ t('common.add') }}
-              </button>
-            </div>
-            <p v-if="reportRecipientError" class="mt-1 text-xs text-red-600 dark:text-red-400">{{ reportRecipientError }}</p>
-            <div class="mt-2 flex flex-wrap gap-2">
-              <span
-                v-for="email in draft.report.recipients"
-                :key="email"
-                class="inline-flex items-center gap-2 rounded-full bg-blue-100 px-3 py-1 text-xs font-medium text-blue-700 dark:bg-blue-900/30 dark:text-blue-400"
-              >
-                {{ email }}
-                <button
-                  type="button"
-                  class="text-blue-700/80 hover:text-blue-900 dark:text-blue-300"
-                  @click="removeRecipient('report', email)"
-                >
-                  ×
-                </button>
-              </span>
-            </div>
+          <div>
+            <div class="mb-1 text-xs font-medium text-gray-600 dark:text-gray-300">{{ t('admin.ops.email.platform') }}</div>
+            <Select v-model="draft.report.platform_id" :options="platformOptions" />
+            <p
+              v-if="draft.report.enabled && platformOptions.length === 0"
+              class="mt-1 text-xs text-amber-700 dark:text-amber-300"
+            >
+              {{ t('admin.ops.email.validation.noPlatformsAvailable') }}
+            </p>
           </div>
+
 
           <div class="md:col-span-2">
             <div class="grid grid-cols-1 gap-4 md:grid-cols-2">

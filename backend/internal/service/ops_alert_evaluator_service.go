@@ -32,9 +32,9 @@ return 0
 `)
 
 type OpsAlertEvaluatorService struct {
-	opsService   *OpsService
-	opsRepo      OpsRepository
-	emailService *EmailService
+	opsService      *OpsService
+	opsRepo         OpsRepository
+	notifyPublisher OpsNotifyPublisher
 
 	redisClient *redis.Client
 	cfg         *config.Config
@@ -64,19 +64,19 @@ type opsAlertRuleState struct {
 func NewOpsAlertEvaluatorService(
 	opsService *OpsService,
 	opsRepo OpsRepository,
-	emailService *EmailService,
+	notifyPublisher OpsNotifyPublisher,
 	redisClient *redis.Client,
 	cfg *config.Config,
 ) *OpsAlertEvaluatorService {
 	return &OpsAlertEvaluatorService{
-		opsService:   opsService,
-		opsRepo:      opsRepo,
-		emailService: emailService,
-		redisClient:  redisClient,
-		cfg:          cfg,
-		instanceID:   uuid.NewString(),
-		ruleStates:   map[int64]*opsAlertRuleState{},
-		emailLimiter: newSlidingWindowLimiter(0, time.Hour),
+		opsService:      opsService,
+		opsRepo:         opsRepo,
+		notifyPublisher: notifyPublisher,
+		redisClient:     redisClient,
+		cfg:             cfg,
+		instanceID:      uuid.NewString(),
+		ruleStates:      map[int64]*opsAlertRuleState{},
+		emailLimiter:    newSlidingWindowLimiter(0, time.Hour),
 	}
 }
 
@@ -601,7 +601,7 @@ func buildOpsAlertDescription(rule *OpsAlertRule, value float64, windowMinutes i
 }
 
 func (s *OpsAlertEvaluatorService) maybeSendAlertEmail(ctx context.Context, runtimeCfg *OpsAlertRuntimeSettings, rule *OpsAlertRule, event *OpsAlertEvent) bool {
-	if s == nil || s.emailService == nil || s.opsService == nil || event == nil || rule == nil {
+	if s == nil || s.notifyPublisher == nil || s.opsService == nil || s.opsRepo == nil || event == nil || rule == nil {
 		return false
 	}
 	if event.EmailSent {
@@ -616,10 +616,17 @@ func (s *OpsAlertEvaluatorService) maybeSendAlertEmail(ctx context.Context, runt
 		return false
 	}
 
-	if len(emailCfg.Alert.Recipients) == 0 {
+	platformID := strings.TrimSpace(emailCfg.Alert.PlatformID)
+	if platformID == "" {
+		log.Printf("[OpsAlertEvaluator] ops email alert enabled but platform_id empty, skipping: rule=%d event=%d", rule.ID, event.ID)
 		return false
 	}
-	if !shouldSendOpsAlertEmailByMinSeverity(strings.TrimSpace(emailCfg.Alert.MinSeverity), strings.TrimSpace(rule.Severity)) {
+
+	minSeverity := strings.TrimSpace(emailCfg.Alert.MinSeverity)
+	if minSeverity == "" {
+		minSeverity = "warning"
+	}
+	if !shouldSendOpsAlertEmailByMinSeverity(minSeverity, strings.TrimSpace(rule.Severity)) {
 		return false
 	}
 
@@ -629,34 +636,53 @@ func (s *OpsAlertEvaluatorService) maybeSendAlertEmail(ctx context.Context, runt
 		}
 	}
 
-	// Apply/update rate limiter.
+	// Best-effort rate limiter (legacy ops setting). This limits enqueued alert jobs.
 	s.emailLimiter.SetLimit(emailCfg.Alert.RateLimitPerHour)
+	if emailCfg.Alert.RateLimitPerHour > 0 && !s.emailLimiter.Allow(time.Now().UTC()) {
+		return false
+	}
 
+	level := opsEmailSeverityForOps(rule.Severity)
 	subject := fmt.Sprintf("[Ops Alert][%s] %s", strings.TrimSpace(rule.Severity), strings.TrimSpace(rule.Name))
-	body := buildOpsAlertEmailBody(rule, event)
-
-	anySent := false
-	for _, to := range emailCfg.Alert.Recipients {
-		addr := strings.TrimSpace(to)
-		if addr == "" {
-			continue
-		}
-		if !s.emailLimiter.Allow(time.Now().UTC()) {
-			continue
-		}
-		if err := s.emailService.SendEmail(ctx, addr, subject, body); err != nil {
-			// Ignore per-recipient failures; continue best-effort.
-			continue
-		}
-		anySent = true
+	content := strings.TrimSpace(event.Description)
+	if content == "" {
+		content = buildOpsAlertDescription(rule, 0, rule.WindowMinutes, "", nil)
 	}
 
-	if anySent {
-		_ = s.opsRepo.UpdateAlertEventEmailSent(context.Background(), event.ID, true)
+	job := NewOpsNotifyJob(OpsNotifyJobKindAlert, "ops.alert")
+	job.PlatformID = platformID
+	job.SubType = strings.TrimSpace(event.Status)
+	job.Severity = level
+	job.Title = subject
+	job.Content = content
+	job.Metadata = map[string]any{
+		"rule_id":  rule.ID,
+		"event_id": event.ID,
+		"status":   event.Status,
+		"severity": rule.Severity,
 	}
-	return anySent
+	if event.Dimensions != nil {
+		job.Metadata["dimensions"] = event.Dimensions
+	}
+
+	job.DedupKey = fmt.Sprintf("ops_alert:%s:rule=%d", strings.TrimSpace(event.Status), rule.ID)
+	if event.Dimensions != nil {
+		if v, ok := event.Dimensions["platform"]; ok {
+			job.DedupKey += fmt.Sprintf(":platform=%v", v)
+		}
+		if v, ok := event.Dimensions["group_id"]; ok {
+			job.DedupKey += fmt.Sprintf(":group_id=%v", v)
+		}
+	}
+
+	if err := s.notifyPublisher.Publish(ctx, job); err != nil {
+		log.Printf("[OpsAlertEvaluator] enqueue notify job failed: rule=%d event=%d err=%v", rule.ID, event.ID, err)
+		return false
+	}
+
+	_ = s.opsRepo.UpdateAlertEventEmailSent(context.Background(), event.ID, true)
+	return true
 }
-
 func buildOpsAlertEmailBody(rule *OpsAlertRule, event *OpsAlertEvent) string {
 	if rule == nil || event == nil {
 		return ""

@@ -13,10 +13,185 @@ import (
 	"github.com/Wei-Shaw/sub2api/internal/server/middleware"
 	"github.com/Wei-Shaw/sub2api/internal/service"
 	"github.com/gin-gonic/gin"
+	"github.com/redis/go-redis/v9"
 )
 
 type OpsHandler struct {
 	opsService *service.OpsService
+	rdb        *redis.Client
+}
+
+func NewOpsHandler(opsService *service.OpsService, redisClient *redis.Client) *OpsHandler {
+	return &OpsHandler{opsService: opsService, rdb: redisClient}
+}
+
+type opsNotifyQueueStatusResponse struct {
+	Enabled bool               `json:"enabled"`
+	Stream  opsNotifyStreamDTO `json:"stream"`
+	DLQ     opsNotifyDLQDTO    `json:"dlq"`
+}
+
+type opsNotifyStreamDTO struct {
+	Key    string                 `json:"key"`
+	Length int64                  `json:"length"`
+	Groups []opsNotifyGroupStatus `json:"groups"`
+	Error  string                 `json:"error,omitempty"`
+}
+
+type opsNotifyGroupStatus struct {
+	Name            string `json:"name"`
+	Consumers       int64  `json:"consumers"`
+	Pending         int64  `json:"pending"`
+	Lag             *int64 `json:"lag,omitempty"`
+	LastDeliveredID string `json:"last_delivered_id,omitempty"`
+}
+
+type opsNotifyDLQDTO struct {
+	Key    string              `json:"key"`
+	Length int64               `json:"length"`
+	Recent []opsNotifyDLQEntry `json:"recent"`
+	Error  string              `json:"error,omitempty"`
+}
+
+type opsNotifyDLQEntry struct {
+	ID       string `json:"id"`
+	At       string `json:"at"`
+	SourceID string `json:"source_id"`
+	Error    string `json:"error"`
+	Attempts int64  `json:"attempts"`
+}
+
+func (h *OpsHandler) GetNotifyQueueStatus(c *gin.Context) {
+	if h.opsService == nil {
+		response.Error(c, http.StatusServiceUnavailable, "Ops service not available")
+		return
+	}
+	ctx := c.Request.Context()
+
+	if !h.opsService.IsMonitoringEnabled(ctx) {
+		response.Success(c, opsNotifyQueueStatusResponse{
+			Enabled: false,
+			Stream: opsNotifyStreamDTO{
+				Key:    service.OpsNotifyStreamKeyDefault,
+				Length: 0,
+				Groups: []opsNotifyGroupStatus{},
+			},
+			DLQ: opsNotifyDLQDTO{
+				Key:    service.OpsNotifyDLQStreamKeyDefault,
+				Length: 0,
+				Recent: []opsNotifyDLQEntry{},
+			},
+		})
+		return
+	}
+
+	out := opsNotifyQueueStatusResponse{
+		Enabled: true,
+		Stream: opsNotifyStreamDTO{
+			Key:    service.OpsNotifyStreamKeyDefault,
+			Length: 0,
+			Groups: []opsNotifyGroupStatus{},
+		},
+		DLQ: opsNotifyDLQDTO{
+			Key:    service.OpsNotifyDLQStreamKeyDefault,
+			Length: 0,
+			Recent: []opsNotifyDLQEntry{},
+		},
+	}
+
+	if h.rdb == nil {
+		out.Stream.Error = "Redis not configured"
+		out.DLQ.Error = "Redis not configured"
+		response.Success(c, out)
+		return
+	}
+
+	if n, err := h.rdb.XLen(ctx, out.Stream.Key).Result(); err != nil {
+		out.Stream.Error = err.Error()
+	} else {
+		out.Stream.Length = n
+	}
+
+	if groups, err := h.rdb.XInfoGroups(ctx, out.Stream.Key).Result(); err != nil {
+		out.Stream.Error = err.Error()
+	} else {
+		mapped := make([]opsNotifyGroupStatus, 0, len(groups))
+		for _, g := range groups {
+			var lag *int64
+			if g.Lag >= 0 {
+				v := g.Lag
+				lag = &v
+			}
+			mapped = append(mapped, opsNotifyGroupStatus{
+				Name:            g.Name,
+				Consumers:       g.Consumers,
+				Pending:         g.Pending,
+				Lag:             lag,
+				LastDeliveredID: g.LastDeliveredID,
+			})
+		}
+		out.Stream.Groups = mapped
+	}
+
+	if n, err := h.rdb.XLen(ctx, out.DLQ.Key).Result(); err != nil {
+		out.DLQ.Error = err.Error()
+	} else {
+		out.DLQ.Length = n
+	}
+
+	msgs, err := h.rdb.XRevRangeN(ctx, out.DLQ.Key, "+", "-", 10).Result()
+	if err != nil {
+		out.DLQ.Error = err.Error()
+	} else {
+		recent := make([]opsNotifyDLQEntry, 0, len(msgs))
+		for _, m := range msgs {
+			recent = append(recent, opsNotifyDLQEntry{
+				ID:       m.ID,
+				At:       toString(m.Values["at"]),
+				SourceID: toString(m.Values["source_id"]),
+				Error:    toString(m.Values["error"]),
+				Attempts: toInt64(m.Values["attempts"]),
+			})
+		}
+		out.DLQ.Recent = recent
+	}
+
+	response.Success(c, out)
+}
+
+func toString(v any) string {
+	switch t := v.(type) {
+	case nil:
+		return ""
+	case string:
+		return t
+	case []byte:
+		return string(t)
+	default:
+		return fmt.Sprintf("%v", t)
+	}
+}
+
+func toInt64(v any) int64 {
+	switch t := v.(type) {
+	case nil:
+		return 0
+	case int:
+		return int64(t)
+	case int64:
+		return t
+	case float64:
+		return int64(t)
+	case string:
+		n, _ := strconv.ParseInt(strings.TrimSpace(t), 10, 64)
+		return n
+	case []byte:
+		n, _ := strconv.ParseInt(strings.TrimSpace(string(t)), 10, 64)
+		return n
+	default:
+		n, _ := strconv.ParseInt(strings.TrimSpace(fmt.Sprintf("%v", t)), 10, 64)
+		return n
+	}
 }
 
 // GetErrorLogByID returns ops error log detail.
@@ -68,10 +243,6 @@ func parseOpsViewParam(c *gin.Context) string {
 	default:
 		return opsListViewErrors
 	}
-}
-
-func NewOpsHandler(opsService *service.OpsService) *OpsHandler {
-	return &OpsHandler{opsService: opsService}
 }
 
 // GetErrorLogs lists ops error logs.

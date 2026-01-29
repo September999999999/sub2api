@@ -157,15 +157,32 @@ func ProvideOpsAggregationService(
 	return svc
 }
 
+// ProvideOpsNotifyPublisher creates Ops notification publisher.
+func ProvideOpsNotifyPublisher(redisClient *redis.Client) OpsNotifyPublisher {
+	return NewRedisOpsNotifyPublisher(redisClient)
+}
+
+func ProvideOpsNotifyConsumerService(
+	opsService *OpsService,
+	opsRepo OpsRepository,
+	redisClient *redis.Client,
+	notificationSvc *NotificationService,
+	cfg *config.Config,
+) *OpsNotifyConsumerService {
+	svc := NewOpsNotifyConsumerService(opsService, opsRepo, redisClient, notificationSvc, cfg)
+	svc.Start()
+	return svc
+}
+
 // ProvideOpsAlertEvaluatorService creates and starts OpsAlertEvaluatorService.
 func ProvideOpsAlertEvaluatorService(
 	opsService *OpsService,
 	opsRepo OpsRepository,
-	emailService *EmailService,
+	opsNotifyPublisher OpsNotifyPublisher,
 	redisClient *redis.Client,
 	cfg *config.Config,
 ) *OpsAlertEvaluatorService {
-	svc := NewOpsAlertEvaluatorService(opsService, opsRepo, emailService, redisClient, cfg)
+	svc := NewOpsAlertEvaluatorService(opsService, opsRepo, opsNotifyPublisher, redisClient, cfg)
 	svc.Start()
 	return svc
 }
@@ -186,11 +203,11 @@ func ProvideOpsCleanupService(
 func ProvideOpsScheduledReportService(
 	opsService *OpsService,
 	userService *UserService,
-	emailService *EmailService,
+	opsNotifyPublisher OpsNotifyPublisher,
 	redisClient *redis.Client,
 	cfg *config.Config,
 ) *OpsScheduledReportService {
-	svc := NewOpsScheduledReportService(opsService, userService, emailService, redisClient, cfg)
+	svc := NewOpsScheduledReportService(opsService, userService, opsNotifyPublisher, redisClient, cfg)
 	svc.Start()
 	return svc
 }
@@ -240,6 +257,11 @@ var ProviderSet = wire.NewSet(
 	NewAccountTestService,
 	NewSettingService,
 	NewOpsService,
+	NewWebhookConfigService,
+	wire.Bind(new(WebhookConfigProvider), new(*WebhookConfigService)),
+	NewNotificationService,
+	ProvideOpsNotifyPublisher,
+	ProvideOpsNotifyConsumerService,
 	ProvideOpsMetricsCollector,
 	ProvideOpsAggregationService,
 	ProvideOpsAlertEvaluatorService,
