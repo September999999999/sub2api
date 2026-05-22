@@ -1602,8 +1602,36 @@ func (h *OpenAIGatewayHandler) acquireImageGenerationSlot(c *gin.Context, stream
 
 // handleConcurrencyError handles concurrency-related errors with proper 429 response
 func (h *OpenAIGatewayHandler) handleConcurrencyError(c *gin.Context, err error, slotType string, streamStarted bool) {
+	if isOpenAIClientCanceledRequest(c, err) {
+		abortOpenAIClientCanceledRequest(c)
+		return
+	}
 	h.handleStreamingAwareError(c, http.StatusTooManyRequests, "rate_limit_error",
 		fmt.Sprintf("Concurrency limit exceeded for %s, please retry later", slotType), streamStarted)
+}
+
+const statusClientClosedRequest = 499
+
+func isOpenAIClientCanceledRequest(c *gin.Context, err error) bool {
+	if errors.Is(err, context.Canceled) {
+		return true
+	}
+	if c == nil || c.Request == nil {
+		return false
+	}
+	reqErr := c.Request.Context().Err()
+	return errors.Is(reqErr, context.Canceled) || errors.Is(reqErr, context.DeadlineExceeded)
+}
+
+func abortOpenAIClientCanceledRequest(c *gin.Context) {
+	if c == nil {
+		return
+	}
+	c.Set(service.OpsSkipPassthroughKey, true)
+	if c.Writer != nil && !c.Writer.Written() {
+		c.Status(statusClientClosedRequest)
+	}
+	c.Abort()
 }
 
 func (h *OpenAIGatewayHandler) handleFailoverExhausted(c *gin.Context, failoverErr *service.UpstreamFailoverError, streamStarted bool) {

@@ -21,6 +21,7 @@ import (
 	"github.com/stretchr/testify/require"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
+	"go.uber.org/zap"
 )
 
 func TestOpenAIHandleStreamingAwareError_JSONEscaping(t *testing.T) {
@@ -130,6 +131,38 @@ func TestOpenAIHandleStreamingAwareError_NonStreaming(t *testing.T) {
 	require.True(t, ok)
 	assert.Equal(t, "upstream_error", errorObj["type"])
 	assert.Equal(t, "test error", errorObj["message"])
+}
+
+func TestOpenAIAcquireResponsesUserSlot_ClientCanceledDoesNotReturnRateLimit(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	c.Request = httptest.NewRequest(http.MethodPost, "/responses", nil).WithContext(ctx)
+
+	cache := &concurrencyCacheMock{
+		acquireUserSlotFn: func(ctx context.Context, userID int64, maxConcurrency int, requestID string) (bool, error) {
+			return false, ctx.Err()
+		},
+	}
+	h := &OpenAIGatewayHandler{
+		concurrencyHelper: NewConcurrencyHelper(service.NewConcurrencyService(cache), SSEPingFormatComment, time.Millisecond),
+	}
+
+	streamStarted := false
+	release, acquired := h.acquireResponsesUserSlot(c, 17, 5, true, &streamStarted, zap.NewNop())
+
+	require.False(t, acquired)
+	require.Nil(t, release)
+	require.Equal(t, statusClientClosedRequest, c.Writer.Status())
+	require.False(t, c.Writer.Written())
+	require.Empty(t, w.Body.String())
+	v, ok := c.Get(service.OpsSkipPassthroughKey)
+	require.True(t, ok)
+	skipOpsLog, ok := v.(bool)
+	require.True(t, ok)
+	require.True(t, skipOpsLog)
 }
 
 func TestReadRequestBodyWithPrealloc(t *testing.T) {
